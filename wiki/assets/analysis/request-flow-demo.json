@@ -1,0 +1,249 @@
+{
+  "verification_mode": "offline replay of application code; model replies, vector confidences and retrieval records are fixed examples; HTTP/Redis/Chroma services are not exercised",
+  "message": "登录时报 401，同时这笔订单被重复扣款 99 元。",
+  "intent": {
+    "llm": {
+      "intent": "technical_login",
+      "confidence": 0.92
+    },
+    "embedding": {
+      "intent": "technical_login",
+      "confidence": 0.85
+    },
+    "pattern": {
+      "intent": "payment_issue",
+      "confidence": 0.5
+    },
+    "final_intent": "technical_login",
+    "final_confidence": 0.814,
+    "urgency": "LOW",
+    "entities": {
+      "order_id": [],
+      "product": [],
+      "date": [],
+      "amount": [
+        "99 元"
+      ],
+      "error_code": [
+        "401"
+      ]
+    }
+  },
+  "domain_scores": {
+    "general": 0.22,
+    "technical": 1.13,
+    "billing": 0.33
+  },
+  "decision": {
+    "primary_agent": "technical",
+    "supporting_agents": [
+      "billing"
+    ],
+    "routing_confidence": 1.0,
+    "routing_reason": "intent=technical_login, group=technical, primary=technical, supporting=billing, scores=[technical=1.13, billing=0.33, general=0.22]"
+  },
+  "conversation_state_after_merge": {
+    "domain": "technical",
+    "entities": {
+      "order_id": [],
+      "product": [],
+      "date": [],
+      "amount": [
+        "99 元"
+      ],
+      "error_code": [
+        "401"
+      ]
+    },
+    "sources": {
+      "amount": "demo-request",
+      "error_code": "demo-request"
+    }
+  },
+  "skills": {
+    "technical": [
+      "技术支持处理规范"
+    ],
+    "billing": [
+      "账单退款处理规范"
+    ],
+    "general": [
+      "通用客服接待规范"
+    ]
+  },
+  "instance_score_examples_only": [
+    {
+      "instance": "technical-A",
+      "total": 100,
+      "success": 95,
+      "avg_ms": 2000.0,
+      "penalty": 0.1,
+      "routing_score": 0.6885
+    },
+    {
+      "instance": "technical-B",
+      "total": 100,
+      "success": 90,
+      "avg_ms": 5000.0,
+      "penalty": 0.0,
+      "routing_score": 0.68
+    }
+  ],
+  "result": {
+    "response": "登录401通常与认证状态有关，请先检查登录状态和令牌有效期。关于重复扣款，目前只有金额信息，请补充订单号、支付时间及支付渠道，再由人工客服核验；当前尚不能确认退款结果。",
+    "status": "success",
+    "escalated": true,
+    "agent_types": [
+      "technical",
+      "billing"
+    ],
+    "tools_used": [
+      "lookup_error_code",
+      "search_knowledge_base",
+      "check_billing_fields"
+    ],
+    "tool_traces": [
+      {
+        "agent_type": "technical",
+        "tool_name": "lookup_error_code",
+        "tool_use_id": "technical_tool_1",
+        "input": {
+          "error_code": "401"
+        },
+        "success": true,
+        "result_success": null,
+        "latency_ms": 1253.6,
+        "cached": false,
+        "reranked": false,
+        "error": "",
+        "source": "local",
+        "mcp_server": null,
+        "mcp_tool": null,
+        "retry_safe": true
+      },
+      {
+        "agent_type": "technical",
+        "tool_name": "search_knowledge_base",
+        "tool_use_id": "technical_tool_2",
+        "input": {
+          "query": "登录401认证失败排查",
+          "top_k": 2
+        },
+        "success": true,
+        "result_success": true,
+        "latency_ms": 1.8,
+        "cached": false,
+        "reranked": true,
+        "error": "",
+        "source": "local",
+        "mcp_server": null,
+        "mcp_tool": null,
+        "retry_safe": true
+      },
+      {
+        "agent_type": "billing",
+        "tool_name": "check_billing_fields",
+        "tool_use_id": "billing_tool_1",
+        "input": {},
+        "success": true,
+        "result_success": null,
+        "latency_ms": 0.1,
+        "cached": false,
+        "reranked": false,
+        "error": "",
+        "source": "local",
+        "mcp_server": null,
+        "mcp_tool": null,
+        "retry_safe": true
+      }
+    ]
+  },
+  "model_calls_by_stage": {
+    "intent": 1,
+    "agent.technical": 2,
+    "agent.billing": 2,
+    "rag.rewrite": 1,
+    "rag.rerank": 1,
+    "composer": 1
+  },
+  "total_model_calls": 8,
+  "vector_recall_calls": 4,
+  "recall_queries": [
+    "登录401认证失败排查",
+    "401认证失败的常见原因",
+    "登录令牌过期后的处理步骤",
+    "账户登录状态核验"
+  ],
+  "same_rag_query_cache_check": {
+    "cached": true,
+    "reranked": true,
+    "additional_model_calls": 0,
+    "returned_titles": [
+      "技术故障排查",
+      "账户安全"
+    ]
+  },
+  "events": [
+    {
+      "event": "model_call",
+      "stage": "intent",
+      "receives_tool_result": false
+    },
+    {
+      "event": "model_call",
+      "stage": "agent.technical",
+      "receives_tool_result": false
+    },
+    {
+      "event": "model_call",
+      "stage": "agent.billing",
+      "receives_tool_result": false
+    },
+    {
+      "event": "model_call",
+      "stage": "rag.rewrite",
+      "receives_tool_result": false
+    },
+    {
+      "event": "model_call",
+      "stage": "agent.billing",
+      "receives_tool_result": true
+    },
+    {
+      "event": "vector_recall",
+      "query": "登录401认证失败排查",
+      "recall_k": 5
+    },
+    {
+      "event": "vector_recall",
+      "query": "401认证失败的常见原因",
+      "recall_k": 5
+    },
+    {
+      "event": "vector_recall",
+      "query": "登录令牌过期后的处理步骤",
+      "recall_k": 5
+    },
+    {
+      "event": "vector_recall",
+      "query": "账户登录状态核验",
+      "recall_k": 5
+    },
+    {
+      "event": "model_call",
+      "stage": "rag.rerank",
+      "receives_tool_result": false
+    },
+    {
+      "event": "model_call",
+      "stage": "agent.technical",
+      "receives_tool_result": true
+    },
+    {
+      "event": "model_call",
+      "stage": "composer",
+      "receives_tool_result": false
+    }
+  ],
+  "usage_reported_calls": 0
+}
