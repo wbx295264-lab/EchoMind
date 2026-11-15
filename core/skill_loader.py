@@ -80,6 +80,7 @@ class SkillManager:
         self.max_prompt_chars = max_prompt_chars
         self._skills: List[Skill] = []
         self._errors: List[str] = []
+        self.evolution = None
 
     @property
     def skills(self) -> List[Skill]:
@@ -119,7 +120,8 @@ class SkillManager:
         """运行时热加载入口，供 API 调用。"""
         return self.load()
 
-    def prompt_for(self, message: str, agent_type: Optional[str] = None) -> str:
+    def prompt_for(self, message: str, agent_type: Optional[str] = None,
+                   user_id: Optional[str] = None) -> str:
         """
         为当前用户请求构建 Skill prompt。
 
@@ -127,7 +129,14 @@ class SkillManager:
         """
         blocks: List[str] = []
         matched: List[tuple[Skill, List[str]]] = []
-        remaining = self.max_prompt_chars
+        learned = ""
+        if self.evolution is not None and user_id:
+            try:
+                learned = self.evolution.prompt_for(
+                    user_id, message, agent_type, min(1800, self.max_prompt_chars // 3))
+            except Exception:
+                logger.exception("用户 Skill 暂不可用，继续使用业务 Skills")
+        remaining = self.max_prompt_chars - len(learned)
         lowered_message = (message or "").lower()
 
         for skill in self._skills:
@@ -145,6 +154,9 @@ class SkillManager:
             remaining -= len(block)
             if remaining <= 0:
                 break
+
+        if learned:
+            blocks.append(learned)
 
         if not blocks:
             logger.debug(

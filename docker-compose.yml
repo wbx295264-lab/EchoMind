@@ -84,9 +84,13 @@ services:
       - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
       - ECHOMIND_SKILLS_DIR=/app/skills
+      - ECHOMIND_SAG2_PATH=/app/data/knowledge/sag2.sqlite3
+      - ECHOMIND_SKILL_EVOLUTION_DIR=/app/data/skill-evolution
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
+      - knowledge-data:/app/data/knowledge
+      - skill-evolution-data:/app/data/skill-evolution
       - ./skills:/app/skills
       - ./config/mcp_servers.json:/app/config/mcp_servers.json:ro
       - ./logs:/app/logs
@@ -141,5 +145,7 @@ networks:
 volumes:
   redis-data:
   chromadb-data:
+  knowledge-data:
+  skill-evolution-data:
   prometheus-data:
   nginx-logs:

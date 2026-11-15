@@ -1,37 +1,28 @@
-"""
-RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
-
-功能：
-  1. 文档导入：将文本切片后存入 ChromaDB（自动生成 Embedding）
-  2. 语义检索：根据 query 从知识库中检索最相关的文档片段
-  3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
-
-ChromaDB 在这里的角色：
-  - memory/ 中用于存储对话记忆（情景记忆 + 用户画像）
-  - 这里用于存储知识库文档（RAG 检索）
-  两者是不同的 collection，互不干扰。
-"""
+"""SAG2 source knowledge base with a compatible Chroma migration path."""
 import asyncio
 import hashlib
 import json
 import logging
 import os
+import re
 import threading
+from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import chromadb
+try:
+    import chromadb
+except ModuleNotFoundError:
+    chromadb = None
+
+from tooling.sag_index import SQLiteKnowledgeIndex
+from tooling.sag_retrieval import EvidenceJudge, SAG2Retriever
 
 logger = logging.getLogger(__name__)
 
 
 class KnowledgeBase:
-    """
-    基于 ChromaDB 的 RAG 知识库。
-
-    ChromaDB 内置了 Embedding 模型（all-MiniLM-L6-v2），
-    调用 add() 时自动生成向量，query() 时自动做语义匹配。
-    不需要额外调用 Anthropic Embeddings API。
-    """
+    """Source import, citation metadata and bounded multi-hop evidence retrieval."""
 
     COLLECTION_NAME = "knowledge_base"
 
@@ -40,10 +31,28 @@ class KnowledgeBase:
         chroma_host: str = "localhost",
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
+        *,
+        backend: Optional[str] = None,
+        sqlite_path: Optional[str] = None,
+        llm_client: Any = None,
+        model: Optional[str] = None,
     ):
-        # 优先连接独立 ChromaDB 服务；默认 embedding_function 在客户端生成向量。
         self._write_lock = threading.RLock()
         self._use_server = False
+        self.backend = (backend or os.getenv("ECHOMIND_KB_BACKEND", "sag2")).lower()
+        if self.backend not in {"sag2", "chroma"}:
+            raise ValueError("ECHOMIND_KB_BACKEND 必须为 sag2 或 chroma")
+        self.supports_rerank = self.backend == "chroma"
+        if self.backend == "sag2":
+            self._index = SQLiteKnowledgeIndex(sqlite_path or os.getenv("ECHOMIND_SAG2_PATH", "./data/knowledge/sag2.sqlite3"))
+            self._collection = self._index
+            self._retriever = SAG2Retriever(self._index, EvidenceJudge(llm_client, model))
+            self._initialize_migration(chroma_host, chroma_port, chroma_path)
+            self._seed_if_empty()
+            return
+        # Explicit compatibility backend retains existing Chroma behavior.
+        if chromadb is None:
+            raise RuntimeError("Chroma 兼容后端需要安装 chromadb")
         try:
             # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
             self._client = chromadb.HttpClient(
@@ -70,10 +79,98 @@ class KnowledgeBase:
             metadata={"description": "EchoMind RAG 知识库"},
         )
 
-        # 如果知识库为空，导入默认文档
+        self._seed_if_empty()
+
+    def _seed_if_empty(self):
         seed_demo = os.getenv("ECHOMIND_SEED_DEMO_DOCS", "true").lower() in {"1", "true", "yes"}
         if os.getenv("ECHOMIND_ENV", "development").lower() != "production" and seed_demo and self._collection.count() == 0:
             self._load_default_docs()
+
+    def _initialize_migration(self, host, port, path):
+        mode = os.getenv("ECHOMIND_KB_MIGRATE_CHROMA", "auto").lower()
+        if mode not in {"auto", "local", "server", "off"}:
+            raise ValueError("ECHOMIND_KB_MIGRATE_CHROMA 必须为 auto、local、server 或 off")
+        previous = self._index.setting("chroma_migration")
+        if previous or mode == "off":
+            self.migration_status = previous or {"status": "disabled"}
+            return
+        local_exists = Path(path, "chroma.sqlite3").is_file()
+        source = "local" if mode == "local" or (mode == "auto" and local_exists) else "server"
+        try:
+            if source == "local":
+                if not local_exists:
+                    raise FileNotFoundError("existing Chroma database not found")
+                client = chromadb.PersistentClient(path=path, settings=chromadb.Settings(anonymized_telemetry=False))
+            else:
+                # Bound first-start discovery before constructing the legacy client.
+                import httpx
+                httpx.get(f"http://{host}:{port}/api/v1/heartbeat", timeout=1.5, trust_env=False).raise_for_status()
+                client = chromadb.HttpClient(host=host, port=port, settings=chromadb.Settings(anonymized_telemetry=False))
+            try:
+                collection = client.get_collection(self.COLLECTION_NAME, embedding_function=None)
+            except Exception as exc:
+                if type(exc).__name__ in {"InvalidCollectionException", "NotFoundError"}:
+                    self.migration_status = {"status": "no_legacy_collection", "source": source}
+                    return
+                raise
+            self.migrate_from_chroma(collection, source=source)
+        except Exception as exc:
+            self.migration_status = {"status": "unavailable", "source": source, "error": type(exc).__name__}
+            if mode != "auto" or local_exists or os.getenv("ECHOMIND_ENV", "development").lower() == "production":
+                raise RuntimeError("旧知识库迁移失败，请恢复 Chroma 连接，或明确配置 ECHOMIND_KB_MIGRATE_CHROMA=off 使用独立新库") from exc
+            logger.warning("旧知识库未发现或暂时不可用，迁移状态为 unavailable")
+
+    def migrate_from_chroma(self, collection, *, source="provided"):
+        """Copy original chunks and metadata exactly once, without embedding calls.
+
+        Existing SQLite documents win over the migration snapshot. The migration
+        marker and all imported rows commit together, so retries are idempotent.
+        """
+        if getattr(self, "backend", None) != "sag2":
+            raise ValueError("migration requires the SAG2 backend")
+        rows = []
+        expected = collection.count()
+        for offset in range(0, expected, 500):
+            batch = collection.get(limit=500, offset=offset, include=["documents", "metadatas"])
+            rows.extend(zip(batch["ids"], batch["documents"], batch["metadatas"]))
+        if len(rows) != expected or collection.count() != expected:
+            raise RuntimeError("legacy knowledge changed during migration; retry from a stable source")
+        with self._write_lock, self._index.transaction():
+            existing_marker = self._index.setting("chroma_migration")
+            if existing_marker:
+                self.migration_status = existing_marker
+                return 0
+            existing = self._index.get()
+            existing_ids = set(existing["ids"])
+            existing_documents = {meta.get("document_id") for meta in existing["metadatas"] if meta.get("document_id")}
+            count = 0
+            for passage_id, content, metadata in rows:
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("legacy passage contains no source text")
+                metadata = dict(metadata or {})
+                metadata.setdefault("title", "")
+                metadata.setdefault("version", hashlib.sha256(content.encode()).hexdigest())
+                title = metadata["title"]
+                canonical_title_id = hashlib.sha256(json.dumps(["title", title], ensure_ascii=True).encode()).hexdigest()
+                legacy_title_id = hashlib.sha256(f"title:{title}".encode()).hexdigest()
+                replaced_title = canonical_title_id in existing_documents and metadata.get("document_id") in {None, "", legacy_title_id}
+                if passage_id in existing_ids or metadata.get("document_id") in existing_documents or replaced_title:
+                    continue
+                self._index.upsert(ids=[passage_id], documents=[content], metadatas=[metadata])
+                count += 1
+            status = {"status": "complete", "source": source, "imported_chunks": count}
+            self._index.set_setting("chroma_migration", status)
+        self.migration_status = status
+        return count
+
+    def stats(self):
+        return {"backend": self.backend, "total_chunks": self.doc_count,
+                "judge": self._retriever.judge.provider if self.backend == "sag2" else None,
+                "migration": getattr(self, "migration_status", None)}
+
+    def close(self):
+        if getattr(self, "backend", None) == "sag2":
+            self._index.close()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
@@ -101,7 +198,8 @@ class KnowledgeBase:
             prepared[identity] = (title, content, bool(doc.get("document_id")))
 
         count = 0
-        with self._write_lock:
+        transaction = self._index.transaction() if getattr(self, "backend", None) == "sag2" else nullcontext()
+        with self._write_lock, transaction:
             for identity, (title, content, explicit) in prepared.items():
                 document_id = hashlib.sha256(identity.encode()).hexdigest()
                 chunks = self._chunk_text(content, chunk_size=500)
@@ -134,15 +232,17 @@ class KnowledgeBase:
         return count
 
     async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
-        """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
+        """Run transactional document imports outside the event loop."""
         return await asyncio.to_thread(self.add_documents, documents)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        语义检索：根据 query 返回最相关的文档片段。
-
-        ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
-        """
+        """Synchronous entry point. Async callers should await search_async()."""
+        if getattr(self, "backend", None) == "sag2":
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(self.search_async(query, top_k))
+            raise RuntimeError("异步环境请使用 await search_async()")
         if type(top_k) is not int or not 1 <= top_k <= 20:
             raise ValueError("top_k 必须是 1–20 的整数")
         count = self._collection.count()
@@ -172,7 +272,13 @@ class KnowledgeBase:
         return items
 
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
+        """Retrieve and judge evidence, then expand through source-grounded terms."""
+        if getattr(self, "backend", None) == "sag2":
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("query 必须是非空字符串")
+            if type(top_k) is not int or not 1 <= top_k <= 20:
+                raise ValueError("top_k 必须是 1–20 的整数")
+            return await self._retriever.search(query, top_k)
         return await asyncio.to_thread(self.search, query, top_k)
 
     @property
@@ -202,30 +308,20 @@ class KnowledgeBase:
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""
-        if len(text) <= chunk_size:
-            return [text] if text.strip() else []
-
-        chunks = []
-        current = ""
-        # 按句子切分
-        sentences = text.replace("\n", "。").split("。")
-        sentences = [sent[i:i + chunk_size] for sent in sentences
-                     for i in range(0, len(sent), chunk_size)]
-        for sent in sentences:
-            sent = sent.strip()
-            if not sent:
-                continue
-            if len(current) + len(sent) + 1 > chunk_size:
-                if current:
-                    chunks.append(current)
-                current = sent
-            else:
-                current = f"{current}。{sent}" if current else sent
-
-        if current:
-            chunks.append(current)
-
+        """Bound chunks while preserving original punctuation and source text."""
+        if chunk_size < 1:
+            raise ValueError("chunk_size 必须大于 0")
+        chunks, start = [], 0
+        while start < len(text):
+            end = min(len(text), start + chunk_size)
+            if end < len(text):
+                boundaries = list(re.finditer(r"[。！？.!?\n]", text[start:end]))
+                if boundaries and boundaries[-1].end() >= chunk_size // 2:
+                    end = start + boundaries[-1].end()
+            chunk = text[start:end]
+            if chunk.strip():
+                chunks.append(chunk)
+            start = end
         return chunks
 
     def _load_default_docs(self) -> None:

@@ -54,6 +54,7 @@ _evaluator    = None
 _eval_orchestrator = None
 _eval_tool_manager = None
 _skill_manager = None
+_skill_evolution = None
 _profile_updater = None
 _mcp_client = None
 from evaluation.jobs import EvaluationJobs
@@ -75,7 +76,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _eval_orchestrator, _eval_tool_manager, _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _profile_updater, _mcp_client
+    global _eval_orchestrator, _eval_tool_manager, _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _skill_evolution, _profile_updater, _mcp_client
 
     from core.access import identity
     identity("")  # 启动时验证生产鉴权配置
@@ -89,6 +90,7 @@ async def lifespan(app: FastAPI):
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
+    from core.skill_evolution import SkillEvolution
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -127,7 +129,7 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
-    # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
+    # MCP 工具管理器 + SAG2 知识库。
     _tool_manager = MCPToolManager(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
@@ -137,7 +139,18 @@ async def lifespan(app: FastAPI):
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+        llm_client=_tool_manager._client,
+        model=cfg["model"],
     )
+    _skill_evolution = SkillEvolution(
+        client=_tool_manager._client,
+        model=cfg["model"],
+        skill_manager=_skill_manager,
+        storage_dir=os.getenv("ECHOMIND_SKILL_EVOLUTION_DIR", str(pathlib.Path(_ROOT) / "data/skill-evolution")),
+        enabled=os.getenv("ECHOMIND_AUTO_SKILL_EVOLUTION", "true").lower() in {"1", "true", "yes"},
+        timeout_s=float(os.getenv("ECHOMIND_SKILL_EVOLUTION_TIMEOUT_S", "12")),
+    )
+    _skill_evolution.start()
     logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
 
     def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
@@ -152,7 +165,7 @@ async def lifespan(app: FastAPI):
 
     _tool_manager.register(Tool(
         name="knowledge_search",
-        description="搜索知识库（基于 ChromaDB 向量检索）",
+        description="搜索知识库并通过 SAG2 多跳扩展收集原文证据",
         handler=kb.search_handler,
         schema={
             "type": "object",
@@ -163,7 +176,8 @@ async def lifespan(app: FastAPI):
             "required": ["query"],
         },
         cache_ttl=300.0,
-        supports_rerank=True,
+        supports_rerank=kb.supports_rerank,
+        handles_retrieval=not kb.supports_rerank,
         fallback=knowledge_fallback,
     ))
     from tooling.mcp_client import StandardMCPClient, load_servers
@@ -209,11 +223,13 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             await _eval_jobs.close()
+            await _skill_evolution.close()
             await _profile_updater.close()
             await _mcp_client.close()
             await _monitor.stop()
             if _memory is not None:
                 await _memory.close()
+            kb.close()
             configure(None)
             logger.info("EchoMind 已关闭")
 
@@ -270,7 +286,7 @@ async def access_control(request: HTTPRequest, call_next):
     if account is not None and request.url.path != "/health" and request.method != "OPTIONS":
         if not account:
             return JSONResponse({"detail": "需要有效 Bearer Token"}, status_code=401)
-        reader = request.url.path in {"/chat", "/search", "/knowledge/stats", "/skills", "/mcp", "/mcp/"}
+        reader = request.url.path in {"/chat", "/search", "/knowledge/stats", "/skills", "/skills/evolution", "/skills/evolution/extract", "/mcp", "/mcp/"}
         if not reader and account["role"] != "admin":
             return JSONResponse({"detail": "该接口需要管理员权限"}, status_code=403)
     is_chat = request.url.path == "/chat" and request.method == "POST"
@@ -358,6 +374,53 @@ async def reload_skills():
     return _skill_manager.summary()
 
 
+class SkillExtractionInput(BaseModel):
+    user_id: str = Field(default="anonymous", min_length=1, max_length=256)
+    conv_id: str = Field(min_length=1, max_length=256)
+    feedback: str = Field(min_length=1, max_length=12000)
+    client_request_id: str = Field(min_length=1, max_length=128)
+
+
+@app.get("/skills/evolution", tags=["Skills"])
+async def skill_evolution_summary(http_request: HTTPRequest, user_id: Optional[str] = None):
+    """查看当前用户的技能版本、使用统计与进化状态。"""
+    if _skill_evolution is None:
+        raise HTTPException(503, "Skill 自进化未初始化")
+    account = getattr(http_request.state, "account", None)
+    if account and (account["role"] != "admin" or user_id is None):
+        user_id = account["user_id"]
+    return _skill_evolution.summary(user_id=user_id or "anonymous")
+
+
+@app.post("/skills/evolution/extract", tags=["Skills"])
+async def extract_skill(body: SkillExtractionInput, http_request: HTTPRequest):
+    """将明确反馈与已有会话窗口结合，立即抽取可复用技能。"""
+    if _skill_evolution is None:
+        raise HTTPException(503, "Skill 自进化未初始化")
+    account = getattr(http_request.state, "account", None)
+    if account:
+        body.user_id = account["user_id"]
+    try:
+        return await _skill_evolution.extract_now(
+            user_id=body.user_id, conv_id=body.conv_id, feedback=body.feedback,
+            request_id=body.client_request_id,
+        )
+    except ValueError as ex:
+        raise HTTPException(400, str(ex)) from ex
+
+
+def _submit_skill_evolution(req: ChatRequest, conv_id: str, client_id: str, response: ChatResponse):
+    if _skill_evolution is None or response.status != "success":
+        return
+    try:
+        _skill_evolution.submit_turn(
+            user_id=req.user_id, conv_id=conv_id, request_id=client_id,
+            message=req.message, response=response.response, agent_type=response.agent_type,
+        )
+    except Exception:
+        logger.exception("已提交会话的 Skill 进化任务暂未入队，可使用相同请求 ID 重试")
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, http_request: HTTPRequest):
     """
@@ -391,6 +454,7 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
                     raise HTTPException(409, "同一 client_request_id 不能用于不同消息")
                 previous = ChatResponse(**receipt["response"])
                 if previous.status != "failed" or not previous.retryable:
+                    _submit_skill_evolution(req, conv_id, client_id, previous)
                     return render(previous)
             # 1. 读取记忆上下文
             with measure_stage("memory_read"):
@@ -461,6 +525,7 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
             )
             await _memory.commit_turn(req.user_id, conv_id, client_id, req.message, response.model_dump(),
                                       _orchestrator.get_tool_trace(result.request_id), state=orch_req.conversation_state)
+            _submit_skill_evolution(req, conv_id, client_id, response)
             if response.status != "failed" and _profile_updater is not None:
                 _profile_updater.submit(req.user_id, conv_id)
             return render(response)
@@ -509,8 +574,7 @@ async def prometheus_metrics():
 @app.post("/search")
 async def search(query: str = Query(min_length=1, max_length=2000), top_k: int = Query(default=5, ge=1, le=20)):
     """
-    演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
-    展示 MCP 工具调用的核心亮点。
+    执行知识库配置的检索流程，默认 SAG2 多跳证据检索。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
@@ -562,7 +626,7 @@ async def add_knowledge(body: BatchDocInput):
     """
     批量导入文档到知识库。
 
-    文档会自动切片（每片 500 字）并存入 ChromaDB，ChromaDB 内置 Embedding 模型自动向量化。
+    文档自动切片，默认写入 SQLite 原文表和 FTS5 全文索引。
 
     示例请求体：
     ```json
@@ -653,7 +717,7 @@ async def knowledge_stats():
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    return {"total_chunks": await kb.doc_count_async()}
+    return await asyncio.to_thread(kb.stats)
 
 
 @app.post("/eval/run", status_code=202)
@@ -815,14 +879,24 @@ async def _cli():
     from tooling.knowledge_base import KnowledgeBase
     from tooling.mcp_client import StandardMCPClient, load_servers
     from agents.tools import build_shared_rag_tools
+    from core.skill_evolution import SkillEvolution
     manager = MCPToolManager(**cfg)
     kb = KnowledgeBase(chroma_host=os.getenv("CHROMA_HOST", "localhost"),
                        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-                       chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/tmp/chroma"))
+                       chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/tmp/chroma"),
+                       llm_client=manager._client, model=cfg["model"])
+    evolution = SkillEvolution(
+        client=manager._client, model=cfg["model"], skill_manager=skill_manager,
+        storage_dir=os.getenv("ECHOMIND_SKILL_EVOLUTION_DIR", str(pathlib.Path(_ROOT) / "data/skill-evolution")),
+        enabled=os.getenv("ECHOMIND_AUTO_SKILL_EVOLUTION", "true").lower() in {"1", "true", "yes"},
+        timeout_s=float(os.getenv("ECHOMIND_SKILL_EVOLUTION_TIMEOUT_S", "12")),
+    )
+    evolution.start()
     manager.register(Tool(name="knowledge_search", description="本地知识库检索",
                           handler=kb.search_handler, schema={"type":"object", "properties":{
                               "query":{"type":"string"}, "top_k":{"type":"integer", "minimum":1}},
-                              "required":["query"]}, cache_ttl=300, supports_rerank=True))
+                              "required":["query"]}, cache_ttl=300, supports_rerank=kb.supports_rerank,
+                          handles_retrieval=not kb.supports_rerank))
     bridge = None
     def refresh():
         tools = build_shared_rag_tools(manager)
@@ -858,11 +932,16 @@ async def _cli():
 
             await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
             await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
+            if result.status == "success":
+                evolution.submit_turn(user_id, conv_id, req.request_id, msg, result.response,
+                                      agent_type=result.agent_type.value)
 
             print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
     finally:
+        await evolution.close()
         await bridge.close()
         await manager._client.close()
+        kb.close()
         await mem.close()
 
 

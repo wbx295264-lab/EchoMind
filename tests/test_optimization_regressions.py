@@ -64,7 +64,7 @@ def test_production_storage_connection_failure_never_switches_to_local(cls, modu
         monkeypatch.setattr(target, "AsyncAnthropic", Mock())
         monkeypatch.setattr(target.redis, "from_url", Mock())
     with pytest.raises(RuntimeError, match="生产环境"):
-        cls()
+        cls(**({"backend": "chroma"} if cls is KnowledgeBase else {}))
     local.assert_not_called()
 
 
@@ -77,7 +77,7 @@ def test_empty_production_knowledge_base_does_not_seed_demo_policies(monkeypatch
     monkeypatch.setattr(module.chromadb, "HttpClient", Mock(return_value=remote), raising=False)
     seed = Mock()
     monkeypatch.setattr(KnowledgeBase, "_load_default_docs", seed)
-    assert KnowledgeBase()._use_server
+    assert KnowledgeBase(backend="chroma")._use_server
     seed.assert_not_called()
 
 

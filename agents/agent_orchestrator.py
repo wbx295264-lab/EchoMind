@@ -490,7 +490,7 @@ class BaseAgent:
         base_prompt = f"{self.system_prompt}{profile_prompt}"
         if self._skill_manager is None:
             return base_prompt
-        skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)
+        skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value, user_id=req.user_id)
         if not skill_prompt:
             return base_prompt
         return f"{base_prompt}\n\n[动态 Skills]\n{skill_prompt}"
@@ -703,7 +703,7 @@ class ResponseComposer:
             f"候选结果：\n{evidence}"
         )
         if self._skill_manager is not None:
-            skill = self._skill_manager.prompt_for(req.message, "general")
+            skill = self._skill_manager.prompt_for(req.message, "general", user_id=req.user_id)
             if skill:
                 prompt += f"\n\n[通用客服输出边界]\n{skill}"
         try:

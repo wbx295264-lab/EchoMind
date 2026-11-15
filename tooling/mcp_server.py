@@ -1,5 +1,6 @@
 """将本地知识库以标准 MCP Tools / Resources 暴露给其他客户端。"""
 import json
+import asyncio
 import os
 from typing import Annotated, Any, Dict, List
 
@@ -50,6 +51,8 @@ async def knowledge_stats() -> str:
     """读取知识库片段数量。"""
     if knowledge_base is None:
         raise ValueError("知识库尚未就绪")
+    if hasattr(knowledge_base, "stats"):
+        return json.dumps(await asyncio.to_thread(knowledge_base.stats), ensure_ascii=False)
     return json.dumps({"total_chunks": await knowledge_base.doc_count_async()})
 
 

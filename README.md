@@ -29,10 +29,10 @@ EchoMind 是面向客服场景的多 Agent 应用，提供通用咨询、技术�
 |---|---|
 | 三路意图识别 | LLM、向量相似度、Pattern 规则共同识别意图，输出领域、实体、紧急度和来源分数。 |
 | 主辅 Agent 路由 | 在 General、Technical、Billing、Escalation 之间选择处理路径；需要协作时并行执行主辅 Agent，再合成回复。 |
-| RAG 工具调用 | Agent 根据问题决定是否调用共享知识库工具，工具层完成检索、可选查询改写与重排。 |
+| SAG2 知识库 | SQLite FTS5 / BM25 召回原文，查询时判断证据并提取关联词，多轮检索补全跨文档依据。 |
 | 分层记忆 | Redis 保存近期消息和摘要；ChromaDB 保存情景记忆及用户画像，为后续对话补充上下文。 |
 | 标准 MCP | 通过官方 Python SDK 接入外部 MCP 服务，也将本地知识库暴露给其他 MCP 客户端。 |
-| 动态 Skills | 从 Markdown 文件加载业务规范，根据 Agent 和关键词匹配后注入提示词，支持运行时重载。 |
+| 自进化 Skills | 结合上一轮结果与下一轮反馈，抽取、合并可复用规则，按用户保存版本、来源和使用统计，自动注入后续对话。 |
 | 故障处理与追踪 | 工具超时、缓存、熔断；专业 Agent 故障回退；通过请求 ID 查询调用轨迹。 |
 | 评测与监控 | 异步执行意图及对话质量评测；提供在线统计、Prometheus 指标和路由降权恢复机制。 |
 
@@ -232,7 +232,8 @@ docker compose --env-file ../EchoMind/.env up -d --build --force-recreate echomi
 | 用途 | 模型与存储 |
 |---|---|
 | 三路意图识别中的向量匹配 | 默认本地字符 n-gram，可配置硅基流动 `BAAI/bge-m3`。 |
-| RAG 知识库及 ChromaDB 记忆检索 | 使用 ChromaDB 默认的本地 `all-MiniLM-L6-v2` 向量模型。 |
+| SAG2 知识库 | SQLite FTS5 / BM25，索引无需 embedding；查询时由配置的证据判断模型辅助扩展。 |
+| ChromaDB 记忆检索 | 使用 ChromaDB 默认的本地 `all-MiniLM-L6-v2` 向量模型。 |
 
 本节只配置**意图识别的向量分支**，不会替换 RAG 模型，也不需要重建知识库。硅基流动的免费模型范围、账号权限和限流以[官方价格页](https://siliconflow.cn/pricing)为准；项目固定使用非 Pro 的 `BAAI/bge-m3`，不会自动切换到 `Pro/BAAI/bge-m3`。聊天及评测的 LLM 费用由对应服务商计算。
 
@@ -347,7 +348,19 @@ docker compose exec -T echomind python scripts/check_embedding.py
 | `retryable`、`error_code` | 执行失败返回 HTTP 503；仅 `retryable=true` 时可以复用请求 ID 重新执行。 |
 | `latency_ms` | 从进入聊天处理、等待会话锁到生成回复的耗时；完整 HTTP 耗时（含存储提交）见 `Server-Timing` 响应头。 |
 
-检索会缓存“查询改写 → 召回 → 重排”的完整结果，并合并并发的相同检索。缓存按查询、Top-K、工具版本和传入的用户上下文隔离，沿用工具的 TTL；知识库更新会使线上及评测缓存失效。工具 TTL 为 0 时关闭完整流程缓存和并发合并，失败检索不缓存。`/search` 和知识库工具结果的 `cached` 表示完整流程命中，此时不再请求改写或重排模型。
+检索默认采用 SAG2，完整结果进入缓存，并合并并发的相同检索。缓存按查询、Top-K、工具版本和传入的用户上下文隔离，沿用工具的 TTL。知识库更新会使线上及评测缓存失效。`/search` 和知识库工具结果的 `cached` 表示完整流程命中。
+
+### SAG2 多跳证据检索
+
+文档经原有导入接口切片后，原文、文档身份和 FTS5 索引在同一个 SQLite 事务中更新。检索从 BM25 候选开始，判断哪些片段有助于回答问题，再从已选证据提取关联词继续召回，最多额外扩展两轮。例如第一篇资料说明某产品使用的支付渠道，第二篇资料说明该渠道的退款时效，第二轮可通过渠道名称找到所需依据。
+
+`ECHOMIND_SAG2_JUDGE=llm` 默认复用现有 Anthropic-compatible 模型做结构化证据判断。`jev` 使用 JEV 的决策协议，需要配置 `JEV_BASE_URL`、`JEV_MODEL` 和 `JEV_API_KEY`。`lexical` 可在离线环境运行。模型不可用时返回带降级标记的词法结果。返回项包含原文、标题、文档及片段标识，便于核对引用。
+
+首次启动时，`ECHOMIND_KB_MIGRATE_CHROMA=auto` 优先检查 `CHROMA_PERSIST_DIRECTORY` 中的旧库，否则探测 `CHROMA_HOST` / `CHROMA_PORT` 服务。迁移复制原文和元数据，并与完成标记一起提交，重复启动可复用结果。已有 SAG2 文档优先保留。也可以明确指定 `local`、`server` 或 `off`。生产环境迁移来源不可用时会中止启动，并报告错误，便于恢复连接后重试。`GET /knowledge/stats` 返回后端类型、判断模型类型、片段数和迁移状态。
+
+`ECHOMIND_SAG2_CANDIDATE_K=40` 控制每轮召回量，`ECHOMIND_SAG2_SEED_K=5` 控制扩展证据数，`ECHOMIND_SAG2_MAX_HOPS=2` 控制额外轮数。总检索预算默认为 20 秒，每轮判断预算为 8 秒。配置项及其默认值见 `.env.example`。如需使用原有 Chroma 检索入口，可设置 `ECHOMIND_KB_BACKEND=chroma`。
+
+该实现参考 SAG2 的 SQLite / BM25 / 查询时关联流程，并适配 EchoMind 的中文资料、原有接口和模型客户端。论文中的评测分数需要在相同数据与模型配置下单独复现。[官方实现](https://github.com/Zleap-AI/SAG-Benchmark/tree/main/sag2)
 
 默认回复提示约 200–400 个中文字符，多角色汇总约 300–500 个字符，保留必要依据、核验条件和下一步；用户明确要求详细说明时允许展开。这是生成时的篇幅指导，不是返回后裁剪，实际达到模型输出上限时仍返回 `partial`。结构化实体优先随角色输入包提供，避免在同一次模型请求中重复发送。
 
@@ -461,6 +474,23 @@ curl http://localhost:8000/skills
 ```
 
 规则通过 Agent 类型和关键词匹配后注入，受字符预算限制；把关键约束放在前面。文件格式与字段说明见 [Skills 使用说明](skills/README.md)。Skills 用于处理规范，业务事实和产品资料更适合放入知识库。
+
+自进化默认启用。成功聊天提交后，后台保存待抽取窗口。下一轮消息作为反馈交给 Extractor 抽取稳定规则，Maintainer 决定 `add`、`merge` 或 `discard`，持久化版本和来源，再供后续同一用户的请求匹配。学习过程复用当前模型配置，模型请求受独立超时约束。该流程参考 BearCode 的在线技能演化设计。[BearCode 实现](https://github.com/Eaglesfikr/BearCode/blob/main/agents/online_skill_evolution.py)
+
+在同一 `conv_id` 下，可以先咨询登录问题，再反馈“以后处理我的登录报错时，先给排查清单，每步附上预期现象”。后台完成抽取后，通过 `GET /skills/evolution?user_id=demo_user` 查看结果。启用鉴权时普通用户身份取自 Bearer Token，管理员可查询指定用户的状态。
+
+`POST /skills/evolution/extract` 可立即处理已有窗口，JSON 请求体如下。
+
+```json
+{
+  "user_id": "demo_user",
+  "conv_id": "使用已有对话返回的 conv_id",
+  "client_request_id": "extract-login-001",
+  "feedback": "以后处理我的登录报错时，先给排查清单，每步附上预期现象。"
+}
+```
+
+重复提交相同请求 ID 会复用已处理任务。学到的规则按用户保存，系统业务规范具有更高优先级。`ECHOMIND_AUTO_SKILL_EVOLUTION=false` 暂停学习及学习规则注入。`ECHOMIND_SKILL_EVOLUTION_DIR` 保存学习数据库和导出的 `SKILL.md`，可与原始 `skills/` 一起备份。
 
 <a id="evaluation"></a>
 
@@ -629,7 +659,9 @@ Authorization: Bearer <EchoMind访问Token>
 | 数据 | 根目录 Compose 中的位置 |
 |---|---|
 | 近期消息、摘要、回执、聊天轨迹 | Redis 命名卷 `redis-data`。 |
-| 知识库、情景记忆和画像 | ChromaDB 命名卷 `chromadb-data`。 |
+| SAG2 知识库 | Compose 命名卷 `knowledge-data`，挂载到 `/app/data/knowledge`。本地默认 `data/knowledge/`。 |
+| 自进化技能及版本、来源 | Compose 命名卷 `skill-evolution-data`，挂载到 `/app/data/skill-evolution`。本地默认 `data/skill-evolution/`。 |
+| 情景记忆和画像、旧版知识库 | ChromaDB 命名卷 `chromadb-data`。 |
 | ChromaDB 本地降级数据 | 项目 `data/chroma/` 挂载到 `/app/data/chroma`。 |
 | 评测基线 | 项目 `data/eval/`。 |
 | Skills 与 MCP 配置 | 项目 `skills/` 和 `config/mcp_servers.json`。 |
@@ -649,7 +681,7 @@ docker compose down
 
 - 推荐单应用进程部署。评测任务、路由状态和工具缓存都在进程内，不支持多 worker 共享。
 - 评测最多同时保留 8 个未完成任务，串行执行，单任务执行上限 1800 秒，保留最近 50 个任务。应用重启后任务状态丢失，需要重新提交。
-- 知识库写入锁是进程内锁，多副本同时导入需要另行协调；ChromaDB 的更新和删除不是跨进程原子事务。
+- SAG2 在同一 SQLite 文件内事务性更新文档及索引，共享该文件的本地进程由 SQLite 协调写入。多主机部署需另行配置存储与缓存失效。
 - 重试回执避免已完成聊天重复写入，但无法保证进程崩溃前后的模型调用恰好执行一次。
 - 当前知识库是共享库，用户会话隔离不等于知识库按租户隔离。接入真实业务数据时，应按实际访问范围扩展权限模型。
 
@@ -667,7 +699,7 @@ docker compose down
 | Embedding 的 `online_configured=false` | 检查 Key 是否为空、模式是否为 `local`、容器是否重新创建。 |
 | Embedding 返回 `http_401` / `http_403` | 检查是否使用硅基流动 Key，以及账号对当前模型的权限。 |
 | Embedding 返回 `http_429`、超时或 `ValueError` | 分别检查限流、网络、响应向量格式；服务会本地降级。等待冷却和缓存过期后，用新问题验证。 |
-| 知识库导入成功但召回异常 | 先检查片段数并独立调用 `/search`；核对文档内容、文档身份及实际连接的 ChromaDB 地址。 |
+| 知识库导入成功但召回异常 | 检查 `/knowledge/stats` 的后端与迁移状态，独立调用 `/search`，核对文档身份及返回的 `scoring_method`。 |
 | MCP 工具没有出现 | 查看 `/integrations/mcp`、网络和白名单；核对 Agent 范围及只读声明。修改配置后重启应用。 |
 | 评测只有任务 ID，没有分数 | 使用 `/eval/jobs/{job_id}` 轮询，在任务完成后读取 `result`。 |
 | 评测失败较多 | 查看 `judge_error_type`、`judge_stop_reason`、`judge_attempts`；区分鉴权、超时、截断、JSON 格式和评分字段错误。 |
@@ -686,6 +718,7 @@ agents/tools.py                Agent 工具封装
 core/intent_recognizer.py      三路意图识别与领域融合
 core/intent_embedding.py       在线向量、本地降级与模板缓存
 core/skill_loader.py           Skills 加载和匹配
+core/skill_evolution.py        反馈抽取、技能合并、版本和来源记录
 core/access.py                 API 身份与角色校验
 memory/conversation_memory.py  Redis / ChromaDB 分层记忆
 tooling/                       工具执行与标准 MCP

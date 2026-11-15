@@ -128,6 +128,7 @@ class Tool:
     timeout_s:   float = 30.0
     supports_rerank: bool = False            # 是否支持结果重排
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
+    handles_retrieval: bool = False          # handler 自行完成多跳扩展和证据排序
 
     # 运行时状态（不参与构造）
     stats:   ToolStats    = field(default_factory=ToolStats, init=False)
@@ -384,6 +385,8 @@ class MCPToolManager:
                 return result
 
     async def _search_uncached(self, tool_name, query, top_k, context):
+        if self._tools[tool_name].handles_retrieval:
+            return await self.call(tool_name, {"query": query, "top_k": top_k}, context)
         # 1. 查询改写：生成多角度子查询
         sub_queries = await self.rewrite_query(query, n=3)
         logger.info(f"查询改写: {query!r} → {sub_queries}")
